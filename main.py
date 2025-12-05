@@ -30,7 +30,7 @@ if not BOT_TOKEN or not GEMINI_API_KEY:
 
 # Настройка Gemini
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-pro')
+model = genai.GenerativeModel('gemini-2.0-flash-lite')
 
 # --- ХРАНИЛИЩЕ КОНТЕКСТА ---
 # Словарь для хранения сессий чата: {user_id: ChatSession object}
