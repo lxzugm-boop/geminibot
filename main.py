@@ -2,9 +2,10 @@ import os
 import asyncio
 import logging
 import sys
+from datetime import date
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.types import Message
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -13,7 +14,6 @@ import google.generativeai as genai
 from aiohttp import web
 
 # --- КОНФИГУРАЦИЯ И СЕКРЕТЫ ---
-# Пытаемся загрузить .env для локального тестирования
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -22,140 +22,244 @@ except ImportError:
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0") or "0")
 
-# Проверка наличия ключей
 if not BOT_TOKEN or not GEMINI_API_KEY:
     print("❌ ОШИБКА: Не найдены BOT_TOKEN или GEMINI_API_KEY в переменных окружения.")
     sys.exit(1)
 
-# Настройка Gemini
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-2.0-flash-lite')
+# --- СИСТЕМНЫЙ ПРОМПТ ДЛЯ "ХАРАКТЕРА" БОТА ---
 
-# --- ХРАНИЛИЩЕ КОНТЕКСТА ---
-# Словарь для хранения сессий чата: {user_id: ChatSession object}
-# ПРИМЕЧАНИЕ: Это хранилище в ОПЕРАТИВНОЙ ПАМЯТИ. Контекст будет сброшен при перезапуске бота!
-user_chats = {} 
+SYSTEM_PROMPT = (
+    "Ты — дерзкий, немного надменный, но в целом доброжелательный Telegram-бот на базе Gemini. "
+    "Отвечаешь с юмором и лёгким сарказмом, можешь слегка подшучивать над пользователем, "
+    "но без оскорблений, токсичности, дискриминации, мата, жестокости и политики. "
+    "Говоришь по-русски, кратко и по делу, иногда добавляешь смайлики или мемные обороты. "
+    "Если вопрос технический или сложный — сначала даёшь суть, потом можешь добавить саркастичный комментарий."
+)
+
+# Настройка Gemini + ограничение длины ответа
+generation_config = {
+    "max_output_tokens": 300,  # режем длину ответа, экономим токены
+    "temperature": 0.7,
+}
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel(
+    "gemini-2.0-flash-lite",
+    generation_config=generation_config,
+)
+
+# --- ХРАНИЛИЩЕ КОНТЕКСТА (по-прежнему в памяти) ---
+# chat_id -> ChatSession
+user_chats = {}
+
+# --- СТАТИСТИКА ИСПОЛЬЗОВАНИЯ ТОКЕНОВ ---
+usage_stats = {
+    "date": date.today(),
+    "requests": 0,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "total_tokens": 0,
+}
 
 # Настройка Aiogram
-# ParseMode.MARKDOWN делает текст красивым
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
 dp = Dispatcher()
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
+
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
 def split_text(text, max_length=4000):
-    """Разбивает длинный текст на части для Telegram (лимит ~4096)"""
-    return [text[i:i+max_length] for i in range(0, len(text), max_length)]
+    return [text[i:i + max_length] for i in range(0, len(text), max_length)]
 
 async def safe_send_message(message: Message, text: str):
-    """
-    Пытается отправить сообщение с Markdown. 
-    Если формат не проходит проверку Telegram, отправляет как обычный текст.
-    """
     parts = split_text(text)
-    
     for part in parts:
         try:
             await message.answer(part, parse_mode=ParseMode.MARKDOWN)
         except Exception:
-            # Отправка без форматирования в случае ошибки
             await message.answer(part, parse_mode=None)
+
+def update_usage_from_response(response):
+    """
+    Обновляем локальную статистику токенов из usage_metadata ответа Gemini.
+    """
+    global usage_stats
+
+    meta = getattr(response, "usage_metadata", None) or getattr(response, "usageMetadata", None)
+    if not meta:
+        return
+
+    input_tokens = (
+        getattr(meta, "prompt_token_count", None)
+        or getattr(meta, "promptTokenCount", None)
+        or getattr(meta, "input_tokens", None)
+        or 0
+    )
+    output_tokens = (
+        getattr(meta, "candidates_token_count", None)
+        or getattr(meta, "candidatesTokenCount", None)
+        or getattr(meta, "output_tokens", None)
+        or 0
+    )
+    total_tokens = (
+        getattr(meta, "total_token_count", None)
+        or getattr(meta, "totalTokenCount", None)
+        or (input_tokens + output_tokens)
+    )
+
+    usage_stats["requests"] += 1
+    usage_stats["input_tokens"] += int(input_tokens or 0)
+    usage_stats["output_tokens"] += int(output_tokens or 0)
+    usage_stats["total_tokens"] += int(total_tokens or 0)
+
 
 # --- ХЕНДЛЕРЫ БОТА ---
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    # При сбросе контекста /start может быть использован для создания новой сессии
     chat_id = message.chat.id
     if chat_id in user_chats:
-         del user_chats[chat_id]
-         
+        del user_chats[chat_id]
+
+    # При /start создаём новую сессию с "характером"
+    user_chats[chat_id] = model.start_chat(history=[
+        {"role": "user", "parts": [SYSTEM_PROMPT]},
+        {"role": "model", "parts": ["Окей, буду дерзким, но вежливым, как ты и просил 😏"]},
+    ])
+
     await message.answer(
-        "👋 **Привет! Я бот с искусственным интеллектом Gemini.**\n\n"
-        "Я помню контекст вашего разговора. Начните беседу!\n"
-        "_(Помните: память сбрасывается при перезапуске сервера.)_"
+        "👋 **Привет! Я твой слегка надменный бот на Gemini.**\n\n"
+        "Пиши, что нужно — отвечу по делу и с лёгким сарказмом.\n"
+        "_Контекст и статистика по токенам живут пока сервер не перезапустят._"
     )
+
+@dp.message(Command("id"))
+async def cmd_id(message: Message):
+    await message.answer(f"Ваш chat_id: `{message.chat.id}`")
 
 @dp.message(F.text)
 async def chat_with_gemini(message: Message):
     chat_id = message.chat.id
-    
-    # 1. Получаем или создаем сессию чата
+
+    # Если по какой-то причине сессия ещё не создана (минуя /start) — создаём с системным промптом
     if chat_id not in user_chats:
-        # Если это первый запрос от пользователя, начинаем новую сессию
-        user_chats[chat_id] = model.start_chat()
-        logging.info(f"Новая сессия чата создана для {chat_id}")
-        
+        user_chats[chat_id] = model.start_chat(history=[
+            {"role": "user", "parts": [SYSTEM_PROMPT]},
+            {"role": "model", "parts": ["Ну, поехали. Я уже настроен отвечать дерзко и с юмором."]},
+        ])
+        logging.info(f"Новая сессия чата с SYSTEM_PROMPT создана для {chat_id}")
+
     chat = user_chats[chat_id]
-    
-    # Показываем статус "печатает..."
+
     await bot.send_chat_action(chat_id=chat_id, action="typing")
 
     try:
-        # 2. Отправляем сообщение в чат-сессию (это сохраняет контекст)
         response = await chat.send_message_async(message.text)
-        
+
+        # Обновляем статистику по токенам
+        try:
+            update_usage_from_response(response)
+        except Exception as e:
+            logging.warning(f"Не удалось обновить статистику токенов: {e}")
+
         if response.text:
             await safe_send_message(message, response.text)
         else:
-            await message.answer("Gemini прислал пустой ответ (возможно, контент был заблокирован).")
-            
+            await message.answer("Gemini прислал пустой ответ. Видимо, шутка не зашла даже для него 🤷‍♂️")
+
     except Exception as e:
         error_msg = str(e)
-        
-        # Обработка ошибки переполнения контекста (слишком много токенов)
         if "Request payload size" in error_msg or "400" in error_msg:
-             # Удаляем старую сессию и создаем новую
-             del user_chats[chat_id]
-             await message.answer(
-                 "🤯 **Память переполнена.**\n"
-                 "История чата стала слишком длинной. Контекст сброшен. Пожалуйста, начните новый диалог."
-             )
+            if chat_id in user_chats:
+                del user_chats[chat_id]
+            await message.answer(
+                "🤯 **Память переполнена.**\n"
+                "История чата разрослась, как ТЗ от маркетолога. Я всё забыл, начинаем по новой."
+            )
         else:
-             logging.error(f"Ошибка при работе с Gemini: {error_msg}")
-             await message.answer(f"⚠️ Произошла ошибка: {error_msg}")
+            logging.error(f"Ошибка при работе с Gemini: {error_msg}")
+            await message.answer(f"⚠️ Произошла ошибка: {error_msg}")
 
-# --- ВЕБ-СЕРВЕР (HEALTH CHECK) ---
-# Нужен, чтобы бесплатный хостинг не "усыплял" приложение
+
+# --- ВЕБ-СЕРВЕР ДЛЯ HEALTH CHECK ---
 
 async def handle_ping(request):
-    """Отвечает "OK" на любой входящий запрос"""
     return web.Response(text="Bot is running! I am alive.")
 
 async def start_web_server():
     app = web.Application()
     app.router.add_get('/', handle_ping)
     app.router.add_get('/health', handle_ping)
-    
+
     runner = web.AppRunner(app)
     await runner.setup()
-    
-    # Render автоматически задает переменную PORT
+
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, '0.0.0.0', port)
-    
+
     logging.info(f"🚀 Запускается веб-сервер на порту {port}")
     await site.start()
-    
-    # Бесконечный цикл, чтобы сервер продолжал работать
+
     while True:
         await asyncio.sleep(3600)
+
+
+# --- ФОНОВЫЙ ТАСК ДЛЯ ЕЖЕДНЕВНОГО ОТЧЁТА ---
+
+async def billing_notifier():
+    """
+    Раз в сутки шлёт тебе в ЛС отчёт по использованию токенов за прошедший день.
+    Работает, только если задан ADMIN_CHAT_ID.
+    """
+    if not ADMIN_CHAT_ID:
+        logging.info("ADMIN_CHAT_ID не задан, уведомления о биллинге отключены.")
+        return
+
+    logging.info(f"Ежедневные уведомления о биллинге включены. ADMIN_CHAT_ID={ADMIN_CHAT_ID}")
+    last_reported_date = usage_stats["date"]
+
+    while True:
+        await asyncio.sleep(3600)  # проверяем раз в час
+
+        today = date.today()
+        if today != last_reported_date:
+            text = (
+                f"📊 Отчёт по использованию Gemini за {last_reported_date}:\n"
+                f"• Запросов: {usage_stats['requests']}\n"
+                f"• Входных токенов: {usage_stats['input_tokens']}\n"
+                f"• Выходных токенов: {usage_stats['output_tokens']}\n"
+                f"• Всего токенов (по данным API): {usage_stats['total_tokens']}\n\n"
+                "Это ориентировочная статистика по токенам, собранная ботом.\n"
+                "Официальные расходы и лимиты смотри в Google AI Studio / Cloud Billing."
+            )
+            try:
+                await bot.send_message(ADMIN_CHAT_ID, text)
+            except Exception as e:
+                logging.error(f"Не удалось отправить отчёт администратору: {e}")
+
+            # Сбрасываем статистику на новый день
+            usage_stats["date"] = today
+            usage_stats["requests"] = 0
+            usage_stats["input_tokens"] = 0
+            usage_stats["output_tokens"] = 0
+            usage_stats["total_tokens"] = 0
+
+            last_reported_date = today
+
 
 # --- ГЛАВНАЯ ФУНКЦИЯ ЗАПУСКА ---
 
 async def main():
     logging.info("🤖 Бот запускается...")
-    # Удаляем вебхуки, если они были, и запускаем поллинг
     await bot.delete_webhook(drop_pending_updates=True)
-    
-    # Запускаем поллинг бота и веб-сервер параллельно
+
     await asyncio.gather(
         dp.start_polling(bot),
-        start_web_server()
+        start_web_server(),
+        billing_notifier(),
     )
 
 if __name__ == "__main__":
