@@ -2,6 +2,7 @@ import os
 import asyncio
 import logging
 import sys
+import time
 from datetime import date
 
 from aiogram import Bot, Dispatcher, F
@@ -38,18 +39,20 @@ SYSTEM_PROMPT = (
     "Если вопрос технический или сложный — сначала даёшь суть, потом можешь добавить саркастичный комментарий."
 )
 
-# Настройка Gemini + ограничение длины ответа
+# --- НАСТРОЙКИ МОДЕЛИ GEMINI ---
+
 generation_config = {
-    "max_output_tokens": 300,  # режем длину ответа, экономим токены
+    "max_output_tokens": 300,  # ограничиваем длину ответа
     "temperature": 0.7,
 }
+
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel(
     "gemini-2.0-flash-lite",
     generation_config=generation_config,
 )
 
-# --- ХРАНИЛИЩЕ КОНТЕКСТА (по-прежнему в памяти) ---
+# --- ХРАНИЛИЩЕ КОНТЕКСТА (в памяти процесса) ---
 # chat_id -> ChatSession
 user_chats = {}
 
@@ -62,12 +65,51 @@ usage_stats = {
     "total_tokens": 0,
 }
 
-# Настройка Aiogram
+# --- ЛИМИТЫ НА ПОЛЬЗОВАТЕЛЯ ---
+
+user_limits = {}  # {chat_id: {"date": date, "count": int}}
+MAX_MESSAGES_PER_DAY = 30  # сколько сообщений в день позволяем одному пользователю
+
+def check_user_limit(chat_id: int) -> bool:
+    """Проверяем, не превысил ли пользователь дневной лимит сообщений."""
+    today = date.today()
+    info = user_limits.get(chat_id)
+
+    if not info or info["date"] != today:
+        user_limits[chat_id] = {"date": today, "count": 0}
+        return True
+
+    return info["count"] < MAX_MESSAGES_PER_DAY
+
+def inc_user_limit(chat_id: int):
+    """Увеличиваем счётчик сообщений пользователя на сегодня."""
+    today = date.today()
+    info = user_limits.get(chat_id)
+    if not info or info["date"] != today:
+        user_limits[chat_id] = {"date": today, "count": 1}
+    else:
+        info["count"] += 1
+
+# --- ГЛОБАЛЬНЫЙ ТРОТТЛИНГ ДЛЯ ЗАПРОСОВ К GEMINI ---
+
+LAST_REQUEST_TS = 0.0
+MIN_DELAY = 0.5  # минимальная пауза между запросами к Gemini (в секундах)
+
+async def wait_for_slot():
+    """Простейший троттлинг: гарантируем паузу между запросами к Gemini."""
+    global LAST_REQUEST_TS
+    now = time.time()
+    delta = now - LAST_REQUEST_TS
+    if delta < MIN_DELAY:
+        await asyncio.sleep(MIN_DELAY - delta)
+    LAST_REQUEST_TS = time.time()
+
+# --- НАСТРОЙКА Aiogram ---
+
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
 dp = Dispatcher()
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
-
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
@@ -115,7 +157,6 @@ def update_usage_from_response(response):
     usage_stats["output_tokens"] += int(output_tokens or 0)
     usage_stats["total_tokens"] += int(total_tokens or 0)
 
-
 # --- ХЕНДЛЕРЫ БОТА ---
 
 @dp.message(CommandStart())
@@ -133,7 +174,7 @@ async def cmd_start(message: Message):
     await message.answer(
         "👋 **Привет! Я твой слегка надменный бот на Gemini.**\n\n"
         "Пиши, что нужно — отвечу по делу и с лёгким сарказмом.\n"
-        "_Контекст и статистика по токенам живут пока сервер не перезапустят._"
+        "_Контекст, лимиты и статистика по токенам живут пока сервер не перезапустят._"
     )
 
 @dp.message(Command("id"))
@@ -144,7 +185,17 @@ async def cmd_id(message: Message):
 async def chat_with_gemini(message: Message):
     chat_id = message.chat.id
 
-    # Если по какой-то причине сессия ещё не создана (минуя /start) — создаём с системным промптом
+    # Проверяем дневной лимит сообщений для пользователя
+    if not check_user_limit(chat_id):
+        await message.answer(
+            "📉 Ты уже исчерпал дневной лимит болтовни со мной.\n"
+            "Я, конечно, умный, но не бесплатная горячая линия. Заходи завтра 😉"
+        )
+        return
+
+    inc_user_limit(chat_id)
+
+    # Если сессия ещё не создана (обошли /start) — создаём с системным промптом
     if chat_id not in user_chats:
         user_chats[chat_id] = model.start_chat(history=[
             {"role": "user", "parts": [SYSTEM_PROMPT]},
@@ -157,6 +208,9 @@ async def chat_with_gemini(message: Message):
     await bot.send_chat_action(chat_id=chat_id, action="typing")
 
     try:
+        # Глобальный троттлинг, чтобы не долбить Gemini слишком часто
+        await wait_for_slot()
+
         response = await chat.send_message_async(message.text)
 
         # Обновляем статистику по токенам
@@ -172,6 +226,17 @@ async def chat_with_gemini(message: Message):
 
     except Exception as e:
         error_msg = str(e)
+
+        # Обработка исчерпания квоты / лимита (429)
+        if "429" in error_msg or "Resource exhausted" in error_msg:
+            logging.warning(f"Переполнен лимит Gemini: {error_msg}")
+            await message.answer(
+                "💥 Похоже, я сегодня уже выговорился сверх нормы.\n"
+                "Сервер Gemini устал и просит передохнуть. Попробуй ещё раз чуть позже 😌"
+            )
+            return
+
+        # Обработка переполнения контекста
         if "Request payload size" in error_msg or "400" in error_msg:
             if chat_id in user_chats:
                 del user_chats[chat_id]
@@ -182,7 +247,6 @@ async def chat_with_gemini(message: Message):
         else:
             logging.error(f"Ошибка при работе с Gemini: {error_msg}")
             await message.answer(f"⚠️ Произошла ошибка: {error_msg}")
-
 
 # --- ВЕБ-СЕРВЕР ДЛЯ HEALTH CHECK ---
 
@@ -206,12 +270,11 @@ async def start_web_server():
     while True:
         await asyncio.sleep(3600)
 
-
 # --- ФОНОВЫЙ ТАСК ДЛЯ ЕЖЕДНЕВНОГО ОТЧЁТА ---
 
 async def billing_notifier():
     """
-    Раз в сутки шлёт тебе в ЛС отчёт по использованию токенов за прошедший день.
+    Раз в сутки шлёт админу отчёт по использованию токенов за прошедший день.
     Работает, только если задан ADMIN_CHAT_ID.
     """
     if not ADMIN_CHAT_ID:
@@ -248,7 +311,6 @@ async def billing_notifier():
             usage_stats["total_tokens"] = 0
 
             last_reported_date = today
-
 
 # --- ГЛАВНАЯ ФУНКЦИЯ ЗАПУСКА ---
 
